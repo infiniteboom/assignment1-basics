@@ -7,14 +7,25 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 
 
 class BPETokenizer:
-    def __init__(self, pattern: str):
-        self.PAT: str = pattern
-        self._pat = re.compile(self.PAT)
+    def __init__(self, pattern: str = None):
+        self.pattern: str = PAT if pattern is None else pattern
+        self.compiled_pattern = re.compile(self.pattern)
         # vocab maps token id -> token bytes (set during training)
         self.vocab: dict[int, bytes] | None = None
         # merge maps a pair of token ids -> rank (creation order) / token id mapping
         self.pair2rank: dict[tuple[int, int], int] | None = None
         self.pair2token: dict[tuple[int, int], int] | None = None
+
+        self.special_tokens = {}
+        self.inverse_special_tokens = {}
+
+    def register_special_tokens(self, special_tokens: dict[str, int]) -> None:
+        # special_tokens is a dictionary of str -> int
+        for _, token in special_tokens.items():
+            if self.vocab is not None and token in self.vocab:
+                raise ValueError(f"special token id {token} collides with existing vocab id")
+        self.special_tokens = special_tokens
+        self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
 
     def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
         """Return frequency counts of adjacent pairs over a word->count map.
@@ -58,7 +69,7 @@ class BPETokenizer:
         with open(text_path, "r", encoding="utf-8") as file:
             line = file.readline()
             while line:
-                word_counter.update(self._pat.findall(line))
+                word_counter.update(self.compiled_pattern.findall(line))
                 line = file.readline()
 
         byte_word_counter: dict[tuple[int, ...], int] = {
@@ -116,9 +127,9 @@ class BPETokenizer:
             seq = self.merge_pair(byte_tuple=seq, pair=pair, new_token=merged_token)
         return seq
 
-    def encode(self, text: str) -> list[int]:
+    def encode_ordinary(self, text: str) -> list[int]:
         res: list[int] = []
-        for m in self._pat.finditer(text):
+        for m in self.compiled_pattern.finditer(text):
             chunk = m.group(0)
             if not chunk:
                 continue
@@ -129,6 +140,30 @@ class BPETokenizer:
     def decode(self, tokens: Sequence[int]) -> str:
         if not self.vocab:
             raise RuntimeError("not train yet")
-        text_bytes = b"".join(self.vocab[token] for token in tokens)
-        text = text_bytes.decode("utf-8", errors="replace")
+        part_bytes = []
+        for ids in tokens:
+            if ids in self.vocab:
+                part_bytes.append(self.vocab[ids])
+            elif ids in self.inverse_special_tokens:
+                part_bytes.append(self.inverse_special_tokens[ids].encode('utf-8'))
+            else:
+                raise ValueError(f"invalid token: {ids}")
+        text_bytes = b"".join(part_bytes)
+        text = text_bytes.decode('utf-8',errors='replace')
         return text
+
+
+    def encode(self, text: str) -> list[int]:
+        special = self.special_tokens
+        if not special:
+            return self.encode_ordinary(text)
+        special_pattern = "(" + "|".join(re.escape(k) for k in special) + ")"
+        special_chunks = re.split(special_pattern, text)
+
+        ids = []
+        for part in special_chunks:
+            if part in special:
+                ids.append(special[part])
+            else:
+                ids.extend(self.encode_ordinary(part))
+        return ids
