@@ -1,16 +1,12 @@
-from json.encoder import INFINITY
-import token  # noqa: F401 (kept; may be unused)
 import regex as re
 from collections import Counter
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-from sympy.geometry import Line
+from typing import Dict, List, Optional, Sequence, Tuple
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-class BPETokenizer:
 
+class BPETokenizer:
     def __init__(self, pattern: str):
         self.PAT: str = pattern
         self._pat = re.compile(self.PAT)
@@ -18,9 +14,13 @@ class BPETokenizer:
         self.vocab: Optional[Dict[int, bytes]] = None
         # merge maps a pair of token ids -> rank (creation order) / token id mapping
         self.pair2rank: Optional[Dict[Tuple[int, int], int]] = None
-        self.pair2token:Optional[Dict[Tuple[int, int], int]] = None
+        self.pair2token: Optional[Dict[Tuple[int, int], int]] = None
 
     def get_rank(self, byte_word_counter: Dict[Tuple[int, ...], int]) -> Dict[Tuple[int, int], int]:
+        """Return frequency counts of adjacent pairs over a word->count map.
+
+        Note: despite the name, this returns pair->count (not creation order).
+        """
         rank: Dict[Tuple[int, int], int] = {}
         for byte_tuple, count in byte_word_counter.items():
             for ind in range(len(byte_tuple) - 1):
@@ -33,7 +33,7 @@ class BPETokenizer:
         i = 0
         a, b = pair
         while i < len(byte_tuple):
-            if i < len(byte_tuple) - 1 and (byte_tuple[i] == a and byte_tuple[i+1] == b):
+            if i < len(byte_tuple) - 1 and (byte_tuple[i] == a and byte_tuple[i + 1] == b):
                 new_list.append(new_token)
                 i += 2
             else:
@@ -55,14 +55,14 @@ class BPETokenizer:
 
     def get_byte_word_counter(self, text_path: str) -> Dict[Tuple[int, ...], int]:
         word_counter: Counter[str] = Counter()
-        with open(text_path, 'r', encoding='utf-8') as file:
+        with open(text_path, "r", encoding="utf-8") as file:
             line = file.readline()
             while line:
                 word_counter.update(self._pat.findall(line))
                 line = file.readline()
 
         byte_word_counter: Dict[Tuple[int, ...], int] = {
-            tuple(key.encode('utf-8')): value for key, value in word_counter.items()
+            tuple(key.encode("utf-8")): value for key, value in word_counter.items()
         }
         return byte_word_counter
 
@@ -73,13 +73,13 @@ class BPETokenizer:
         vocab: Dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
         counter: Dict[Tuple[int, ...], int] = byte_word_counter
         pair2rank: Dict[Tuple[int, int], int] = {}
-        pair2token:Dict[Tuple[int, int], int] = {}
+        pair2token: Dict[Tuple[int, int], int] = {}
         for idx in range(vocab_size - 256):
             rank = self.get_rank(counter)
             if not rank:
                 break
-            pair = max(rank.items(),key = lambda x:x[1])[0]
-            a,b  = pair
+            pair = max(rank.items(), key=lambda x: x[1])[0]
+            a, b = pair
             new_token = 256 + idx
             vocab[new_token] = vocab[a] + vocab[b]
             pair2rank[pair] = idx
@@ -92,20 +92,22 @@ class BPETokenizer:
     def find_best_pair(self, seq: Sequence[int]) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
         if self.pair2rank is None:
             raise RuntimeError("not train yet")
-        
+
         best_score = math.inf
         best_pair = None
         for i in range(len(seq) - 1):
-            pair = (seq[i], seq[i+1])
+            pair = (seq[i], seq[i + 1])
             score = self.pair2rank.get(pair, math.inf)
             if score < best_score:
                 best_score = score
                 best_pair = pair
-        merged_token = self.pair2token.get(best_pair, None) if (self.pair2token is not None and best_pair is not None) else None
+        merged_token = (
+            self.pair2token.get(best_pair, None) if (self.pair2token is not None and best_pair is not None) else None
+        )
         return best_pair, merged_token
 
     def encode_chunk(self, text: str) -> tuple[int, ...]:
-        seq: tuple[int, ...] = tuple(text.encode('utf-8'))
+        seq: tuple[int, ...] = tuple(text.encode("utf-8"))
         while True:
             pair, merged_token = self.find_best_pair(seq=seq)
             if pair is None:
@@ -123,8 +125,10 @@ class BPETokenizer:
             seq = self.encode_chunk(chunk)
             res.extend(seq)
         return res
-    
+
     def decode(self, tokens: Sequence[int]) -> str:
+        if not self.vocab:
+            raise RuntimeError("not train yet")
         text_bytes = b"".join(self.vocab[token] for token in tokens)
-        text = text_bytes.decode('utf-8', errors='replace')
+        text = text_bytes.decode("utf-8", errors="replace")
         return text
