@@ -1,6 +1,5 @@
 import regex as re
-from collections import Counter
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 import math
 
 
@@ -18,12 +17,12 @@ class BPETokenizerList:
     def __init__(self, pattern: str):
         self.PAT: str = pattern
         self._pat = re.compile(self.PAT)
-        self.vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-        self.pair2rank: Dict[Tuple[int, int], int] = {}
-        self.pair2id: Dict[Tuple[int, int], int] = {}
+        self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+        self.pair2rank: dict[tuple[int, int], int] = {}
+        self.pair2id: dict[tuple[int, int], int] = {}
 
-    def _count_pairs(self, seqs: Sequence[Sequence[int]]) -> Dict[Tuple[int, int], int]:
-        counts: Dict[Tuple[int, int], int] = {}
+    def _count_pairs(self, seqs: Sequence[Sequence[int]]) -> dict[tuple[int, int], int]:
+        counts: dict[tuple[int, int], int] = {}
         for s in seqs:
             # skip empty/length-1 sequences
             if len(s) < 2:
@@ -34,9 +33,9 @@ class BPETokenizerList:
         return counts
 
     @staticmethod
-    def _merge_seq(seq: Sequence[int], pair: Tuple[int, int], new_id: int) -> List[int]:
+    def _merge_seq(seq: Sequence[int], pair: tuple[int, int], new_id: int) -> list[int]:
         a, b = pair
-        out: List[int] = []
+        out: list[int] = []
         i = 0
         n = len(seq)
         while i < n:
@@ -50,7 +49,7 @@ class BPETokenizerList:
 
     def train(self, input_path: str, vocab_size: int) -> None:
         # 1) Build list of sequences from corpus using regex chunks
-        seqs: List[List[int]] = []
+        seqs: list[list[int]] = []
         with open(input_path, 'r', encoding='utf-8') as f:
             for line in f:
                 for m in self._pat.finditer(line):
@@ -77,9 +76,9 @@ class BPETokenizerList:
                     continue
                 seqs[k] = self._merge_seq(s, (a, b), new_id)
 
-    def _find_best_pair(self, seq: Sequence[int]) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
+    def _find_best_pair(self, seq: Sequence[int]) -> tuple[tuple[int, int] | None, int | None]:
         # choose the present pair with minimal rank
-        best_pair: Optional[Tuple[int, int]] = None
+        best_pair: tuple[int, int] | None = None
         best_rank = math.inf
         for i in range(len(seq) - 1):
             p = (seq[i], seq[i + 1])
@@ -90,8 +89,8 @@ class BPETokenizerList:
         new_id = self.pair2id.get(best_pair) if best_pair is not None else None
         return best_pair, new_id
 
-    def encode_chunk(self, text: str) -> List[int]:
-        seq: List[int] = list(text.encode('utf-8'))
+    def encode_chunk(self, text: str) -> list[int]:
+        seq: list[int] = list(text.encode('utf-8'))
         while True:
             pair, new_id = self._find_best_pair(seq)
             if pair is None:
@@ -100,8 +99,8 @@ class BPETokenizerList:
             seq = self._merge_seq(seq, pair, new_id)
         return seq
 
-    def encode(self, text: str) -> List[int]:
-        out: List[int] = []
+    def encode(self, text: str) -> list[int]:
+        out: list[int] = []
         for m in self._pat.finditer(text):
             chunk = m.group(0)
             if not chunk:
@@ -112,4 +111,3 @@ class BPETokenizerList:
     def decode(self, tokens: Sequence[int]) -> str:
         text_bytes = b"".join(self.vocab[t] for t in tokens)
         return text_bytes.decode('utf-8', errors='replace')
-

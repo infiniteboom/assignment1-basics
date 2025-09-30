@@ -1,7 +1,7 @@
 import regex as re
 from collections import Counter
+from collections.abc import Sequence
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -11,25 +11,25 @@ class BPETokenizer:
         self.PAT: str = pattern
         self._pat = re.compile(self.PAT)
         # vocab maps token id -> token bytes (set during training)
-        self.vocab: Optional[Dict[int, bytes]] = None
+        self.vocab: dict[int, bytes] | None = None
         # merge maps a pair of token ids -> rank (creation order) / token id mapping
-        self.pair2rank: Optional[Dict[Tuple[int, int], int]] = None
-        self.pair2token: Optional[Dict[Tuple[int, int], int]] = None
+        self.pair2rank: dict[tuple[int, int], int] | None = None
+        self.pair2token: dict[tuple[int, int], int] | None = None
 
-    def get_rank(self, byte_word_counter: Dict[Tuple[int, ...], int]) -> Dict[Tuple[int, int], int]:
+    def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
         """Return frequency counts of adjacent pairs over a word->count map.
 
         Note: despite the name, this returns pair->count (not creation order).
         """
-        rank: Dict[Tuple[int, int], int] = {}
+        rank: dict[tuple[int, int], int] = {}
         for byte_tuple, count in byte_word_counter.items():
             for ind in range(len(byte_tuple) - 1):
                 pair = (byte_tuple[ind], byte_tuple[ind + 1])
                 rank[pair] = rank.get(pair, 0) + count
         return rank
 
-    def merge_pair(self, byte_tuple: Sequence[int], pair: Tuple[int, int], new_token: int) -> Tuple[int, ...]:
-        new_list: List[int] = []
+    def merge_pair(self, byte_tuple: Sequence[int], pair: tuple[int, int], new_token: int) -> tuple[int, ...]:
+        new_list: list[int] = []
         i = 0
         a, b = pair
         while i < len(byte_tuple):
@@ -43,17 +43,17 @@ class BPETokenizer:
 
     def update_counter(
         self,
-        byte_word_counter: Dict[Tuple[int, ...], int],
-        pair: Tuple[int, int],
+        byte_word_counter: dict[tuple[int, ...], int],
+        pair: tuple[int, int],
         new_token: int,
-    ) -> Dict[Tuple[int, ...], int]:
-        updated_counter: Dict[Tuple[int, ...], int] = {}
+    ) -> dict[tuple[int, ...], int]:
+        updated_counter: dict[tuple[int, ...], int] = {}
         for byte_tuple, count in byte_word_counter.items():
             new_tuple = self.merge_pair(byte_tuple, pair, new_token)
             updated_counter[new_tuple] = updated_counter.get(new_tuple, 0) + count
         return updated_counter
 
-    def get_byte_word_counter(self, text_path: str) -> Dict[Tuple[int, ...], int]:
+    def get_byte_word_counter(self, text_path: str) -> dict[tuple[int, ...], int]:
         word_counter: Counter[str] = Counter()
         with open(text_path, "r", encoding="utf-8") as file:
             line = file.readline()
@@ -61,19 +61,19 @@ class BPETokenizer:
                 word_counter.update(self._pat.findall(line))
                 line = file.readline()
 
-        byte_word_counter: Dict[Tuple[int, ...], int] = {
+        byte_word_counter: dict[tuple[int, ...], int] = {
             tuple(key.encode("utf-8")): value for key, value in word_counter.items()
         }
         return byte_word_counter
 
     def train(self, text_path: str, vocab_size: int) -> None:
-        byte_word_counter: Dict[Tuple[int, ...], int] = self.get_byte_word_counter(text_path=text_path)
+        byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter(text_path=text_path)
         if vocab_size < 256:
             vocab_size = 256
-        vocab: Dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
-        counter: Dict[Tuple[int, ...], int] = byte_word_counter
-        pair2rank: Dict[Tuple[int, int], int] = {}
-        pair2token: Dict[Tuple[int, int], int] = {}
+        vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
+        counter: dict[tuple[int, ...], int] = byte_word_counter
+        pair2rank: dict[tuple[int, int], int] = {}
+        pair2token: dict[tuple[int, int], int] = {}
         for idx in range(vocab_size - 256):
             rank = self.get_rank(counter)
             if not rank:
@@ -89,7 +89,7 @@ class BPETokenizer:
         self.pair2rank = pair2rank
         self.pair2token = pair2token
 
-    def find_best_pair(self, seq: Sequence[int]) -> Tuple[Optional[Tuple[int, int]], Optional[int]]:
+    def find_best_pair(self, seq: Sequence[int]) -> tuple[tuple[int, int] | None, int | None]:
         if self.pair2rank is None:
             raise RuntimeError("not train yet")
 
