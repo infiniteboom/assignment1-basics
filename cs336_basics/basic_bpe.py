@@ -12,12 +12,19 @@ class BPETokenizer:
         self.compiled_pattern = re.compile(self.pattern)
         # vocab maps token id -> token bytes (set during training)
         self.vocab: dict[int, bytes] | None = None
+        self.inverse_vocab: dict[bytes, int] | None = None
         # merge maps a pair of token ids -> rank (creation order) / token id mapping
         self.pair2rank: dict[tuple[int, int], int] | None = None
         self.pair2token: dict[tuple[int, int], int] | None = None
 
+        self.merge = []
+
         self.special_tokens = {}
         self.inverse_special_tokens = {}
+
+    def update_inverse_vocab(self) -> None:
+        assert self.vocab is not None
+        self.inverse_vocab = {bt:token for token,bt in self.vocab.items()}
 
     def register_special_tokens(self, special_tokens: dict[str, int]) -> None:
         # special_tokens is a dictionary of str -> int
@@ -28,8 +35,8 @@ class BPETokenizer:
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
 
     def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
-        """Return frequency counts of adjacent pairs over a word->count map.
-
+        """
+        Return frequency counts of adjacent pairs over a word->count map.
         Note: despite the name, this returns pair->count (not creation order).
         """
         rank: dict[tuple[int, int], int] = {}
@@ -85,11 +92,13 @@ class BPETokenizer:
         counter: dict[tuple[int, ...], int] = byte_word_counter
         pair2rank: dict[tuple[int, int], int] = {}
         pair2token: dict[tuple[int, int], int] = {}
+        merge = []
         for idx in range(vocab_size - 256):
             rank = self.get_rank(counter)
             if not rank:
                 break
             pair = max(rank.items(), key=lambda x: x[1])[0]
+            merge.append(pair)
             a, b = pair
             new_token = 256 + idx
             vocab[new_token] = vocab[a] + vocab[b]
@@ -97,6 +106,8 @@ class BPETokenizer:
             pair2token[pair] = new_token
             counter = self.update_counter(counter, pair, new_token)
         self.vocab = vocab
+        self.update_inverse_vocab()
+        self.merge = merge
         self.pair2rank = pair2rank
         self.pair2token = pair2token
 
@@ -118,7 +129,10 @@ class BPETokenizer:
         return best_pair, merged_token
 
     def encode_chunk(self, text: str) -> tuple[int, ...]:
+        if self.inverse_vocab is None:
+            raise RuntimeError("not train yet")
         seq: tuple[int, ...] = tuple(text.encode("utf-8"))
+        seq = tuple([self.inverse_vocab[bytes([bt])] for bt in seq])
         while True:
             pair, merged_token = self.find_best_pair(seq=seq)
             if pair is None:
