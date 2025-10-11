@@ -1,38 +1,82 @@
-import regex as re
+import math
 from collections import Counter
 from collections.abc import Sequence
-import math
+
+import regex as re
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 class BPETokenizer:
-    def __init__(self, pattern: str = None):
+    def __init__(
+        self,
+        pattern: str | None = None,
+        vocab: dict[int, bytes] | None = None,
+        merges: list[tuple[bytes, bytes]] | None = None,
+        special_tokens: list[str] | None = None,
+    ):
         self.pattern: str = PAT if pattern is None else pattern
         self.compiled_pattern = re.compile(self.pattern)
+
         # vocab maps token id -> token bytes (set during training)
-        self.vocab: dict[int, bytes] | None = None
-        self.inverse_vocab: dict[bytes, int] | None = None
-        # merge maps a pair of token ids -> rank (creation order) / token id mapping
-        self.pair2rank: dict[tuple[int, int], int] | None = None
-        self.pair2token: dict[tuple[int, int], int] | None = None
+        self.vocab: dict[int, bytes] | None = vocab
+        self.inverse_vocab: dict[bytes, int] | None
+        self.update_inverse_vocab()
 
-        self.merge = []
+        self.merges: list[tuple[int, int]] = []
+        self.merge_ranks: dict[tuple[int, int], int] = {}
+        if merges is not None:
+            self._load_merges(merges)
 
-        self.special_tokens = {}
-        self.inverse_special_tokens = {}
+        self.special_tokens: dict[str, int] = {}
+        self.inverse_special_tokens: dict[int, str] = {}
+        self.register_special_tokens(special_tokens=special_tokens)
 
     def update_inverse_vocab(self) -> None:
-        assert self.vocab is not None
-        self.inverse_vocab = {bt:token for token,bt in self.vocab.items()}
+        if self.vocab is None:
+            self.inverse_vocab = None
+        else:
+            self.inverse_vocab = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
 
-    def register_special_tokens(self, special_tokens: dict[str, int]) -> None:
-        # special_tokens is a dictionary of str -> int
-        for _, token in special_tokens.items():
-            if self.vocab is not None and token in self.vocab:
-                raise ValueError(f"special token id {token} collides with existing vocab id")
-        self.special_tokens = special_tokens
-        self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
+    def register_special_tokens(self, special_tokens: list[str] | None) -> None:
+        self.special_tokens = {}
+        self.inverse_special_tokens = {}
+        if not special_tokens:
+            return
+
+        if self.vocab is None:
+            self.vocab = {}
+        if self.inverse_vocab is None:
+            self.update_inverse_vocab()
+
+        next_id = max(self.vocab.keys(), default=-1) + 1
+        for token in special_tokens:
+            token_bytes = token.encode("utf-8")
+            token_id = self.inverse_vocab.get(token_bytes)
+            if token_id is None:
+                token_id = next_id
+                next_id += 1
+                self.vocab[token_id] = token_bytes
+            self.special_tokens[token] = token_id
+
+        self.inverse_special_tokens = {v: k for k, v in self.special_tokens.items()}
+        self.update_inverse_vocab()
+
+    def _load_merges(self, merges: list[tuple[bytes, bytes]]) -> None:
+        if self.inverse_vocab is None:
+            self.update_inverse_vocab()
+        if self.inverse_vocab is None:
+            raise ValueError("Cannot load merges without an initialized vocabulary.")
+        prepared: list[tuple[int, int]] = []
+        for left_bytes, right_bytes in merges:
+            left = self.inverse_vocab[left_bytes]
+            right = self.inverse_vocab[right_bytes]
+            prepared.append((left, right))
+        self._set_trained_merges(prepared)
+
+    def _set_trained_merges(self, merges: list[tuple[int, int]]) -> None:
+        self.merges = merges
+        self.merge_ranks = {pair: idx for idx, pair in enumerate(merges)}
 
     def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
         """
@@ -84,47 +128,58 @@ class BPETokenizer:
         }
         return byte_word_counter
 
-    def train(self, text_path: str, vocab_size: int) -> None:
+    def train(
+        self,
+        text_path: str,
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        special_tokens = special_tokens or []
         byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter(text_path=text_path)
-        if vocab_size < 256:
-            vocab_size = 256
+
+        target_vocab = max(vocab_size, 256 + len(special_tokens))
         vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
         counter: dict[tuple[int, ...], int] = byte_word_counter
-        pair2rank: dict[tuple[int, int], int] = {}
-        pair2token: dict[tuple[int, int], int] = {}
-        merge = []
-        for idx in range(vocab_size - 256):
+
+        merges: list[tuple[int, int]] = []
+        for idx in range(target_vocab - 256 - len(special_tokens)):
             rank = self.get_rank(counter)
             if not rank:
                 break
-            pair = max(rank.items(), key=lambda x: x[1])[0]
-            merge.append(pair)
+            pair = max(
+                rank.items(),
+                key=lambda item: (item[1], vocab[item[0][0]] + vocab[item[0][1]]),
+            )[0]
+            merges.append(pair)
             a, b = pair
             new_token = 256 + idx
             vocab[new_token] = vocab[a] + vocab[b]
-            pair2rank[pair] = idx
-            pair2token[pair] = new_token
+
             counter = self.update_counter(counter, pair, new_token)
+
         self.vocab = vocab
         self.update_inverse_vocab()
-        self.merge = merge
-        self.pair2rank = pair2rank
-        self.pair2token = pair2token
+        self._set_trained_merges(merges)
+        self.register_special_tokens(special_tokens=special_tokens)
+
+    def get_score(self, pair: tuple[int, int]) -> int:
+        return self.merge_ranks.get(pair, math.inf)
+
+    def get_new_token(self, score: int) -> int:
+        return 256 + score
 
     def find_best_pair(self, seq: Sequence[int]) -> tuple[tuple[int, int] | None, int | None]:
-        if self.pair2rank is None:
-            raise RuntimeError("not train yet")
-
         best_score = math.inf
         best_pair = None
         for i in range(len(seq) - 1):
             pair = (seq[i], seq[i + 1])
-            score = self.pair2rank.get(pair, math.inf)
+            score = self.get_score(pair=pair)
             if score < best_score:
                 best_score = score
                 best_pair = pair
+
         merged_token = (
-            self.pair2token.get(best_pair, None) if (self.pair2token is not None and best_pair is not None) else None
+            self.get_new_token(score=best_score) if not math.isinf(best_score) else None
         )
         return best_pair, merged_token
 
@@ -154,18 +209,16 @@ class BPETokenizer:
     def decode(self, tokens: Sequence[int]) -> str:
         if not self.vocab:
             raise RuntimeError("not train yet")
-        part_bytes = []
-        for ids in tokens:
-            if ids in self.vocab:
-                part_bytes.append(self.vocab[ids])
-            elif ids in self.inverse_special_tokens:
-                part_bytes.append(self.inverse_special_tokens[ids].encode('utf-8'))
+        part_bytes: list[bytes] = []
+        for token_id in tokens:
+            if token_id in self.vocab:
+                part_bytes.append(self.vocab[token_id])
+            elif token_id in self.inverse_special_tokens:
+                part_bytes.append(self.inverse_special_tokens[token_id].encode("utf-8"))
             else:
-                raise ValueError(f"invalid token: {ids}")
+                raise ValueError(f"invalid token: {token_id}")
         text_bytes = b"".join(part_bytes)
-        text = text_bytes.decode('utf-8',errors='replace')
-        return text
-
+        return text_bytes.decode("utf-8", errors="replace")
 
     def encode(self, text: str) -> list[int]:
         special = self.special_tokens
@@ -174,7 +227,7 @@ class BPETokenizer:
         special_pattern = "(" + "|".join(re.escape(k) for k in special) + ")"
         special_chunks = re.split(special_pattern, text)
 
-        ids = []
+        ids: list[int] = []
         for part in special_chunks:
             if part in special:
                 ids.append(special[part])
