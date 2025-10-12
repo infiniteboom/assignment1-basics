@@ -1,8 +1,76 @@
 import math
 from collections import Counter
 from collections.abc import Sequence
-
 import regex as re
+import os
+from typing import BinaryIO
+from typing import Generator
+from pathlib import Path
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+def read_chunks(
+        path:Path,
+        num_chunks:int,
+        split_token:bytes | None,
+) -> Generator[str,None,None]:
+    with open(path,"rb") as fh:
+        if split_token is None:
+            fh.seek(0,2)
+            boundaries = [0,fh.tell()]
+        else:
+            boundaries = find_chunk_boundaries(fh,num_chunks,split_token)
+
+        for start,end in zip(boundaries[:-1],boundaries[1:]):
+            fh.seek(start)
+            chunk_bytes = fh.read(end - start)
+            if not chunk_bytes:
+                continue
+            yield chunk_bytes.decode("utf-8",errors="ignore")
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -116,6 +184,22 @@ class BPETokenizer:
             new_tuple = self.merge_pair(byte_tuple, pair, new_token)
             updated_counter[new_tuple] = updated_counter.get(new_tuple, 0) + count
         return updated_counter
+    
+
+    def get_byte_word_counter_by_chunk(self, 
+                                       text_path: str,
+                                       split_token:bytes | None,
+                                       num_chunks:int) -> dict[tuple[int, ...], int]:
+        counter:Counter[str] = Counter()
+        for text_chunk in read_chunks(text_path,num_chunks=num_chunks,split_token=split_token):
+            if self.special_pattern is None:
+                counter.update(self.compiled_pattern.findall(text_chunk))
+            else:
+                for part in self.special_pattern.split(text_chunk):
+                    if not part or (self._special_token_set and part in self._special_token_set):
+                        continue
+                    counter.update(self.compiled_pattern.findall(part))
+        return {tuple(token.encode("utf-8")): freq for token, freq in counter.items()}
 
     def get_byte_word_counter(self, text_path: str) -> dict[tuple[int, ...], int]:
         word_counter: Counter[str] = Counter()
@@ -155,7 +239,11 @@ class BPETokenizer:
         special_tokens = special_tokens or []
         self.set_special_pattern(special_tokens=special_tokens)
 
-        byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter(text_path=text_path)
+        byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter_by_chunk(
+            text_path=text_path,
+            split_token=b"<|endoftext|>",
+            num_chunks= 4
+        )
 
         target_vocab = max(vocab_size, 256 + len(special_tokens))
         vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
@@ -172,6 +260,7 @@ class BPETokenizer:
                                   vocab[item[0][0]],
                                   vocab[item[0][0]] + vocab[item[0][1]]),
             )[0]
+
             merges.append(pair)
             a, b = pair
             new_token = 256 + idx
