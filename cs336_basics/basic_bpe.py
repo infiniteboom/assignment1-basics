@@ -63,23 +63,6 @@ class BPETokenizer:
 
         self.inverse_special_tokens = {v: k for k, v in self.special_tokens.items()}
         self.update_inverse_vocab()
-        # 设置特殊token的正则表达式模式
-        if special_tokens:
-            self.set_special_pattern(special_tokens)
-
-    def register_special_tokens_without_vocab(self, special_tokens: list[str]) -> None:
-        """注册特殊token但不添加到词汇表"""
-        self.special_tokens = {}
-        self.inverse_special_tokens = {}
-
-        # 为特殊token分配负数ID，避免与词汇表冲突
-        for i, token in enumerate(special_tokens):
-            token_id = -(i + 1)  # 使用负数ID
-            self.special_tokens[token] = token_id
-            self.inverse_special_tokens[token_id] = token
-
-        # 设置特殊token的正则表达式模式
-        self.set_special_pattern(special_tokens)
 
     def _load_merges(self, merges: list[tuple[bytes, bytes]]) -> None:
         if self.inverse_vocab is None:
