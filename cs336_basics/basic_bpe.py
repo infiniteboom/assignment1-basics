@@ -148,7 +148,9 @@ class BPETokenizer:
                 break
             pair = max(
                 rank.items(),
-                key=lambda item: (item[1], vocab[item[0][0]] + vocab[item[0][1]]),
+                key=lambda item: (item[1], 
+                                  vocab[item[0][0]],
+                                  vocab[item[0][0]] + vocab[item[0][1]]),
             )[0]
             merges.append(pair)
             a, b = pair
