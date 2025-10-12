@@ -122,16 +122,14 @@ class BPETokenizer:
         special_pattern = self.special_pattern
         special_set = self._special_token_set
         with open(text_path, "r", encoding="utf-8") as file:
-            line = file.readline()
-            while line:
-                if special_pattern is None:
-                    word_counter.update(self.compiled_pattern.findall(line))
-                else:
-                    for part in special_pattern.split(line):
-                        if not part or (special_set is not None and part in special_set):
-                            continue
-                        word_counter.update(self.compiled_pattern.findall(part))
-                line = file.readline()
+            text = file.read()
+            if special_pattern is None:
+                word_counter.update(self.compiled_pattern.findall(text))
+            else:
+                for part in special_pattern.split(text):
+                    if not part or (special_set is not None and part in special_set):
+                        continue
+                    word_counter.update(self.compiled_pattern.findall(part))
 
         byte_word_counter: dict[tuple[int, ...], int] = {
             tuple(key.encode("utf-8")): value for key, value in word_counter.items()
@@ -159,12 +157,12 @@ class BPETokenizer:
 
         byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter(text_path=text_path)
 
-        target_vocab = max(vocab_size, 256)
+        target_vocab = max(vocab_size, 256 + len(special_tokens))
         vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
         counter: dict[tuple[int, ...], int] = byte_word_counter
 
         merges: list[tuple[int, int]] = []
-        for idx in range(target_vocab - 256):
+        for idx in range(target_vocab - 256 - len(special_tokens)):
             rank = self.get_rank(counter)
             if not rank:
                 break
@@ -185,9 +183,9 @@ class BPETokenizer:
         self.update_inverse_vocab()
         self._set_trained_merges(merges)
 
-        # 注册特殊tokens但不添加到词汇表
+        # 注册特殊tokens
         if special_tokens:
-            self.register_special_tokens_without_vocab(special_tokens)
+            self.register_special_tokens(special_tokens)
 
     def get_score(self, pair: tuple[int, int]) -> int:
         return self.merge_ranks.get(pair, math.inf)
