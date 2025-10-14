@@ -114,13 +114,42 @@ def _process_chunk(task_args:tuple) -> Counter:
     return counter
 
 
-def _process_rank_chunk(byte_word_counter_chunk:list[tuple]) -> dict[(int,int),int]:
-    rank:dict[(int,int),int] = {}
+def _process_rank_chunk(byte_word_counter_chunk: list[tuple[tuple[int, ...], int]]) -> dict[tuple[int, int], int]:
+    # Local rank computation over a chunk of (byte_tuple, count) items
+    rank: dict[tuple[int, int], int] = {}
     for byte_tuple, count in byte_word_counter_chunk:
-            for ind in range(len(byte_tuple) - 1):
-                pair = (byte_tuple[ind], byte_tuple[ind + 1])
-                rank[pair] = rank.get(pair, 0) + count
+        for ind in range(len(byte_tuple) - 1):
+            pair = (byte_tuple[ind], byte_tuple[ind + 1])
+            rank[pair] = rank.get(pair, 0) + count
     return rank
+
+def _merge_pair(byte_tuple: Sequence[int], pair: tuple[int, int], new_token: int) -> tuple[int, ...]:
+    new_list: list[int] = []
+    i = 0
+    a, b = pair
+    while i < len(byte_tuple):
+        if i < len(byte_tuple) - 1 and (byte_tuple[i] == a and byte_tuple[i + 1] == b):
+            new_list.append(new_token)
+            i += 2
+        else:
+            new_list.append(byte_tuple[i])
+            i += 1
+    return tuple(new_list)
+
+def _update_counter_chunk(byte_word_counter_chunk: list[tuple[tuple[int, ...], int]],
+                          pair: tuple[int, int],
+                          new_token: int,) -> dict[tuple[int, int], int]:
+    # Apply a single merge to a chunk of (byte_tuple, count) items
+    updated_counter: dict[tuple[int, ...], int] = {}
+    for byte_tuple, count in byte_word_counter_chunk:
+        new_tuple = _merge_pair(byte_tuple, pair, new_token)
+        updated_counter[new_tuple] = updated_counter.get(new_tuple, 0) + count
+    return updated_counter
+
+def _update_counter_chunk_args(args: tuple) -> dict[tuple[int, int], int]:
+    # Wrapper to avoid functools.partial pickling quirks on some platforms
+    byte_word_counter_chunk, pair, new_token = args
+    return _update_counter_chunk(byte_word_counter_chunk, pair, new_token)
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -243,6 +272,44 @@ class BPETokenizerParallel:
                 new_list.append(byte_tuple[i])
                 i += 1
         return tuple(new_list)
+    
+    def update_counter_parallel(
+        self,
+        byte_word_counter: dict[tuple[int, ...], int],
+        pair: tuple[int, int],
+        new_token: int,
+        num_workers:int
+    ) -> dict[tuple[int, ...], int]:
+        # Fast-path fallbacks to avoid parallel overhead on small inputs
+        if not byte_word_counter or num_workers <= 1:
+            return self.update_counter(byte_word_counter, pair, new_token)
+
+        n = len(byte_word_counter)
+        threshold = max(50_000, 10_000 * num_workers)
+        if n < threshold:
+            return self.update_counter(byte_word_counter, pair, new_token)
+
+        all_items = list(byte_word_counter.items())
+        num_workers = max(1, num_workers)
+        chunk_size = (n + num_workers - 1) // num_workers
+        chunks = [all_items[i:i + chunk_size] for i in range(0, n, chunk_size)]
+        if not chunks:
+            return {}
+
+        procs = min((os.cpu_count() or 1), num_workers, len(chunks))
+
+        total_counter: Counter = Counter()
+        # Use spawn context for better cross-platform stability
+        try:
+            ctx = multiprocessing.get_context('spawn')
+        except Exception:
+            ctx = multiprocessing
+        with ctx.Pool(processes=procs) as pool:
+            arg_iter = ((chunk, pair, new_token) for chunk in chunks)
+            for local_counter in pool.imap_unordered(_update_counter_chunk_args, arg_iter, chunksize=1):
+                total_counter.update(local_counter)
+
+        return dict(total_counter)
 
     def update_counter(
         self,
