@@ -113,6 +113,15 @@ def _process_chunk(task_args:tuple) -> Counter:
             counter.update(g_compiled_pattern.findall(part))
     return counter
 
+
+def _process_rank_chunk(byte_word_counter_chunk:list[tuple]) -> dict[(int,int),int]:
+    rank:dict[(int,int),int] = {}
+    for byte_tuple, count in byte_word_counter_chunk:
+            for ind in range(len(byte_tuple) - 1):
+                pair = (byte_tuple[ind], byte_tuple[ind + 1])
+                rank[pair] = rank.get(pair, 0) + count
+    return rank
+
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
@@ -189,11 +198,32 @@ class BPETokenizerParallel:
         self.merges = merges
         self.merge_ranks = {pair: idx for idx, pair in enumerate(merges)}
 
+    def get_rank_parallel(
+            self,
+            byte_word_counter: dict[tuple[int, ...], int],
+            num_workers:int
+    ) -> dict[tuple[int,int],int]:
+        if len(byte_word_counter) < 5000:
+            return self.get_rank(byte_word_counter=byte_word_counter)
+
+        all_items = list(byte_word_counter.items())
+        chunk_size = (len(all_items) + num_workers - 1) // num_workers
+        chunks = [all_items[i:i + chunk_size] for i in range(0, len(all_items), chunk_size)]
+        procs = min(os.cpu_count() or 1, num_workers, len(chunks))
+        with multiprocessing.Pool(processes=procs) as pool:
+            list_of_counter_iter = pool.imap_unordered(_process_rank_chunk,chunks)
+
+            total_counter = Counter()
+            for local_counter in list_of_counter_iter:
+                total_counter.update(local_counter)
+        
+        return dict(total_counter)
+    
     def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
         """
         Return frequency counts of adjacent pairs over a word->count map.
         Note: despite the name, this returns pair->count (not creation order).
-        """
+        """  
         rank: dict[tuple[int, int], int] = {}
         for byte_tuple, count in byte_word_counter.items():
             for ind in range(len(byte_tuple) - 1):
@@ -312,7 +342,7 @@ class BPETokenizerParallel:
 
         merges: list[tuple[int, int]] = []
         for idx in range(target_vocab - 256 - len(special_tokens)):
-            rank = self.get_rank(counter)
+            rank = self.get_rank_parallel(counter, num_workers=4)
             if not rank:
                 break
             pair = max(
