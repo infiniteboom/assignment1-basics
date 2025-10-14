@@ -7,6 +7,7 @@ from typing import BinaryIO
 from typing import Generator
 from pathlib import Path
 import multiprocessing
+from multiprocessing.pool import Pool
 from functools import partial
 
 g_compiled_pattern = None
@@ -146,9 +147,8 @@ def _update_counter_chunk(byte_word_counter_chunk: list[tuple[tuple[int, ...], i
         updated_counter[new_tuple] = updated_counter.get(new_tuple, 0) + count
     return updated_counter
 
-def _update_counter_chunk_args(args: tuple) -> dict[tuple[int, int], int]:
+def _update_counter_chunk_args(byte_word_counter_chunk,pair,new_token) -> dict[tuple[int, int], int]:
     # Wrapper to avoid functools.partial pickling quirks on some platforms
-    byte_word_counter_chunk, pair, new_token = args
     return _update_counter_chunk(byte_word_counter_chunk, pair, new_token)
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -230,22 +230,20 @@ class BPETokenizerParallel:
     def get_rank_parallel(
             self,
             byte_word_counter: dict[tuple[int, ...], int],
-            num_workers:int
-    ) -> dict[tuple[int,int],int]:
+            pool: Pool,
+    ) -> dict[tuple[int, int], int]:
+        # Small input fallback
         if len(byte_word_counter) < 5000:
             return self.get_rank(byte_word_counter=byte_word_counter)
 
         all_items = list(byte_word_counter.items())
-        chunk_size = (len(all_items) + num_workers - 1) // num_workers
+        procs = getattr(pool, "_processes", 1) or 1
+        chunk_size = (len(all_items) + procs - 1) // procs
         chunks = [all_items[i:i + chunk_size] for i in range(0, len(all_items), chunk_size)]
-        procs = min(os.cpu_count() or 1, num_workers, len(chunks))
-        with multiprocessing.Pool(processes=procs) as pool:
-            list_of_counter_iter = pool.imap_unordered(_process_rank_chunk,chunks)
 
-            total_counter = Counter()
-            for local_counter in list_of_counter_iter:
-                total_counter.update(local_counter)
-        
+        total_counter = Counter()
+        for local_counter in pool.imap_unordered(_process_rank_chunk, chunks):
+            total_counter.update(local_counter)
         return dict(total_counter)
     
     def get_rank(self, byte_word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
@@ -278,37 +276,28 @@ class BPETokenizerParallel:
         byte_word_counter: dict[tuple[int, ...], int],
         pair: tuple[int, int],
         new_token: int,
-        num_workers:int
+        pool: Pool,
     ) -> dict[tuple[int, ...], int]:
-        # Fast-path fallbacks to avoid parallel overhead on small inputs
-        if not byte_word_counter or num_workers <= 1:
+        # Derive worker count from the provided pool
+        procs = getattr(pool, "_processes", 1) or 1
+        if not byte_word_counter or procs <= 1:
             return self.update_counter(byte_word_counter, pair, new_token)
 
         n = len(byte_word_counter)
-        threshold = max(50_000, 10_000 * num_workers)
+        threshold = max(50_000, 10_000 * procs)
         if n < threshold:
             return self.update_counter(byte_word_counter, pair, new_token)
 
         all_items = list(byte_word_counter.items())
-        num_workers = max(1, num_workers)
-        chunk_size = (n + num_workers - 1) // num_workers
+        chunk_size = (n + procs - 1) // procs
         chunks = [all_items[i:i + chunk_size] for i in range(0, n, chunk_size)]
         if not chunks:
             return {}
 
-        procs = min((os.cpu_count() or 1), num_workers, len(chunks))
-
         total_counter: Counter = Counter()
-        # Use spawn context for better cross-platform stability
-        try:
-            ctx = multiprocessing.get_context('spawn')
-        except Exception:
-            ctx = multiprocessing
-        with ctx.Pool(processes=procs) as pool:
-            arg_iter = ((chunk, pair, new_token) for chunk in chunks)
-            for local_counter in pool.imap_unordered(_update_counter_chunk_args, arg_iter, chunksize=1):
-                total_counter.update(local_counter)
-
+        arg_iter = ((chunk, pair, new_token) for chunk in chunks)
+        for local_counter in pool.imap_unordered(_update_counter_chunk_args, arg_iter, chunksize=1):
+            total_counter.update(local_counter)
         return dict(total_counter)
 
     def update_counter(
@@ -326,8 +315,13 @@ class BPETokenizerParallel:
 
     def get_byte_word_counter_by_chunk(self, 
                                        text_path: str,
-                                       split_token:bytes | None,
-                                       num_chunks:int) -> dict[tuple[int, ...], int]:
+                                       split_token: bytes | None,
+                                       num_chunks: int,
+                                       pool: Pool | None = None) -> dict[tuple[int, ...], int]:
+        # Small-input fast path: avoid Pool overhead
+        if pool is None:
+            # Fall back to serial path (still respects special token filtering)
+            return self.get_byte_word_counter(text_path)
         
         path = Path(text_path)
         with open(path, "rb") as f:
@@ -345,17 +339,14 @@ class BPETokenizerParallel:
         if not tasks:
             return {}
 
-        num_workers = min(os.cpu_count(),len(tasks))
-        total_counter = Counter()
-        with multiprocessing.Pool(
-            processes=num_workers,
-            initializer=_init_worker,
-            initargs=(self.pattern, list(self._special_token_set) if self._special_token_set else [])
-        ) as pool:
-            
-            counter_iterator = pool.imap_unordered(_process_chunk, tasks)
-            for counter in counter_iterator:
-                total_counter.update(counter)
+        # Small-input fast path: avoid Pool overhead when only one chunk
+        if len(tasks) <= 1:
+            return self.get_byte_word_counter(text_path)
+
+        total_counter = Counter() 
+        counter_iterator = pool.imap_unordered(_process_chunk, tasks)
+        for counter in counter_iterator:
+            total_counter.update(counter)
 
         return {tuple(token.encode("utf-8")): freq for token, freq in total_counter.items()}
 
@@ -393,44 +384,52 @@ class BPETokenizerParallel:
         text_path: str,
         vocab_size: int,
         special_tokens: list[str] | None = None,
+        num_workers:int = 8
     ) -> None:
         special_tokens = special_tokens or []
         self.set_special_pattern(special_tokens=special_tokens)
 
-        byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter_by_chunk(
-            text_path=text_path,
-            split_token=b"<|endoftext|>",
-            num_chunks= 4
-        )
-
         target_vocab = max(vocab_size, 256 + len(special_tokens))
         vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
-        counter: dict[tuple[int, ...], int] = byte_word_counter
+        # Initialize pool lazily (here we create once to reuse across phases)
 
-        merges: list[tuple[int, int]] = []
-        for idx in range(target_vocab - 256 - len(special_tokens)):
-            rank = self.get_rank_parallel(counter, num_workers=4)
-            if not rank:
-                break
-            pair = max(
+        with multiprocessing.Pool(
+            processes=num_workers,
+            initializer=_init_worker,
+            initargs=(self.pattern, list(self._special_token_set) if self._special_token_set else [])
+        ) as pool:
+            byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter_by_chunk(
+                text_path=text_path,
+                split_token=b"<|endoftext|>",
+                num_chunks=num_workers,
+                pool=pool,
+            )
+            counter: dict[tuple[int, ...], int] = byte_word_counter
+
+            merges: list[tuple[int, int]] = []
+            for idx in range(target_vocab - 256 - len(special_tokens)):
+                # Use pooled parallel rank with small-input fallback inside
+                rank = self.get_rank_parallel(counter, pool=pool)
+                if not rank:
+                    break
+                pair = max(
                 rank.items(),
                 key=lambda item: (item[1],
                                   vocab[item[0][0]],
                                   vocab[item[0][0]] + vocab[item[0][1]]),
-            )[0]
+                )[0]
+                merges.append(pair)
+                a, b = pair
+                new_token = 256 + idx
+                vocab[new_token] = vocab[a] + vocab[b]
 
-            merges.append(pair)
-            a, b = pair
-            new_token = 256 + idx
-            vocab[new_token] = vocab[a] + vocab[b]
+                # Parallel update with pool; function falls back to serial when too small
+                counter = self.update_counter_parallel(counter, pair, new_token, pool=pool)
 
-            counter = self.update_counter(counter, pair, new_token)
-
+        # Finalize tokenizer state
         self.vocab = vocab
         self.update_inverse_vocab()
         self._set_trained_merges(merges)
-
-        # 注册特殊tokens
         if special_tokens:
             self.register_special_tokens(special_tokens)
 
