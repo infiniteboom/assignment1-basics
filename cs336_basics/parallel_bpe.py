@@ -6,7 +6,7 @@ import os
 from typing import BinaryIO
 from typing import Generator
 from pathlib import Path
-import multiprocessing
+import multiprocessing as mp
 from multiprocessing.pool import Pool
 from functools import partial
 
@@ -393,11 +393,17 @@ class BPETokenizerParallel:
         vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
         # Initialize pool lazily (here we create once to reuse across phases)
 
-        with multiprocessing.Pool(
+        # Prefer 'fork' to reduce startup and tear-down overhead when available (Linux)
+        try:
+            ctx = mp.get_context('fork') if 'fork' in mp.get_all_start_methods() else mp.get_context()
+        except Exception:
+            ctx = mp
+        pool = ctx.Pool(
             processes=num_workers,
             initializer=_init_worker,
             initargs=(self.pattern, list(self._special_token_set) if self._special_token_set else [])
-        ) as pool:
+        )
+        try:
             byte_word_counter: dict[tuple[int, ...], int] = self.get_byte_word_counter_by_chunk(
                 text_path=text_path,
                 split_token=b"<|endoftext|>",
@@ -412,11 +418,11 @@ class BPETokenizerParallel:
                 rank = self.get_rank_parallel(counter, pool=pool)
                 if not rank:
                     break
+                # Tiebreak on equal counts using bytes lexicographic order of (left,right).
+                # Compare by the actual byte expansions, not token ids.
                 pair = max(
-                rank.items(),
-                key=lambda item: (item[1],
-                                  vocab[item[0][0]],
-                                  vocab[item[0][0]] + vocab[item[0][1]]),
+                    rank.items(),
+                    key=lambda item: (item[1], (vocab[item[0][0]], vocab[item[0][1]])),
                 )[0]
                 merges.append(pair)
                 a, b = pair
@@ -425,6 +431,12 @@ class BPETokenizerParallel:
 
                 # Parallel update with pool; function falls back to serial when too small
                 counter = self.update_counter_parallel(counter, pair, new_token, pool=pool)
+        finally:
+            # Graceful shutdown to avoid expensive terminate() path in context manager __exit__
+            try:
+                pool.close()
+            finally:
+                pool.join()
 
         # Finalize tokenizer state
         self.vocab = vocab

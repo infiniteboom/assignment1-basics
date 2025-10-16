@@ -254,11 +254,12 @@ class BPETokenizer:
             rank = self.get_rank(counter)
             if not rank:
                 break
+            # Tiebreak: prefer lexicographically larger (left,right) bytes when counts tie.
+            # Comparing (vocab[a], vocab[b]) directly is equivalent to comparing
+            # (vocab[a], vocab[a] + vocab[b]) but avoids the bytes concat and is clearer.
             pair = max(
                 rank.items(),
-                key=lambda item: (item[1],
-                                  vocab[item[0][0]],
-                                  vocab[item[0][0]] + vocab[item[0][1]]),
+                key=lambda item: (item[1], (vocab[item[0][0]], vocab[item[0][1]])),
             )[0]
 
             merges.append(pair)
